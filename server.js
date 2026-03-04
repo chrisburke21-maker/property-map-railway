@@ -90,6 +90,7 @@ async function fetchProperties() {
     gps_lat: parseFloat(r.gps_lat),
     gps_long: parseFloat(r.gps_long),
     dom: r.days_on_market,
+    date_first_seen: r.date_first_seen,
     listings: r.listings || [],
     airtable_prices: enrichMap[r.id] || []
   }));
@@ -195,9 +196,27 @@ function buildHTML(properties, pricingMatrix) {
     <input type="number" id="maxAcres" placeholder="Any" step="any">
   </div>
   <div class="field">
-    <label>County ID</label>
-    <input type="text" id="countyId" placeholder="Search...">
+    <label>County</label>
+    <select id="countyFilter">
+      <option value="">All Counties</option>
+      <option value="Mohave">Mohave, AZ</option>
+      <option value="Costilla">Costilla, CO</option>
+      <option value="Elko">Elko, NV</option>
+      <option value="Putnam">Putnam, FL</option>
+      <option value="Apache">Apache, AZ</option>
+      <option value="Modoc">Modoc, CA</option>
+    </select>
   </div>
+  <div class="field">
+    <label>From</label>
+    <input type="date" id="dateFrom" style="width:140px">
+  </div>
+  <div class="field">
+    <label>To</label>
+    <input type="date" id="dateTo" style="width:140px">
+  </div>
+  <button onclick="setDateRange(6)" style="background:#475569;padding:6px 10px;font-size:12px;height:33px">6mo</button>
+  <button onclick="setDateRange(12)" style="background:#475569;padding:6px 10px;font-size:12px;height:33px">12mo</button>
   <div class="field">
     <label>Status</label>
     <select id="status">
@@ -668,14 +687,17 @@ function renderMarkers(data) {
   });
 }
 
-function filterPricingMatrix(minA, maxA, cid, radiusVal) {
+function filterPricingMatrix(minA, maxA, county, radiusVal, dateFrom, dateTo) {
   return (window.PRICING_MATRIX || []).filter(function(pm) {
     if (pm.acreage && pm.acreage < minA) return false;
     if (pm.acreage && maxA < Infinity && pm.acreage > maxA) return false;
-    if (cid) {
-      var matchCounty = (pm.county || '').toLowerCase().includes(cid);
-      var matchCid = (pm.county_identifier || '').toLowerCase().includes(cid);
-      if (!matchCounty && !matchCid) return false;
+    if (county && (pm.county || '') !== county) return false;
+    // Date filter (date_observed)
+    if (dateFrom || dateTo) {
+      var d = pm.date ? pm.date.substring(0, 10) : '';
+      if (dateFrom && d && d < dateFrom) return false;
+      if (dateTo && d && d > dateTo) return false;
+      if (!d) return false;
     }
     // Radius filter
     if (radiusCenter && radiusVal > 0) {
@@ -690,12 +712,22 @@ function filterPricingMatrix(minA, maxA, cid, radiusVal) {
   });
 }
 
+function setDateRange(months) {
+  var from = new Date();
+  from.setMonth(from.getMonth() - months);
+  document.getElementById('dateFrom').value = from.toISOString().split('T')[0];
+  document.getElementById('dateTo').value = '';
+  applyFilters();
+}
+
 function applyFilters() {
   const minA = parseFloat(document.getElementById('minAcres').value) || 0;
   const maxA = parseFloat(document.getElementById('maxAcres').value) || Infinity;
-  const cid = document.getElementById('countyId').value.trim().toLowerCase();
+  const county = document.getElementById('countyFilter').value;
   const status = document.getElementById('status').value;
   const radiusVal = parseFloat(document.getElementById('radius').value) || 0;
+  const dateFrom = document.getElementById('dateFrom').value;
+  const dateTo = document.getElementById('dateTo').value;
 
   // Remove old radius circle
   if (radiusCircle) { map.removeLayer(radiusCircle); radiusCircle = null; }
@@ -703,12 +735,15 @@ function applyFilters() {
   const filtered = window.PROPERTIES.filter(p => {
     if (p.acreage < minA) return false;
     if (p.acreage > maxA) return false;
-    if (cid) {
-      var mc = (p.county || '').toLowerCase().includes(cid);
-      var mi = (p.county_identifier || '').toLowerCase().includes(cid);
-      if (!mc && !mi) return false;
-    }
+    if (county && (p.county || '') !== county) return false;
     if (status && p.status !== status) return false;
+    // Date filter (date_first_seen)
+    if (dateFrom || dateTo) {
+      var dfs = p.date_first_seen ? p.date_first_seen.substring(0, 10) : '';
+      if (dateFrom && dfs && dfs < dateFrom) return false;
+      if (dateTo && dfs && dfs > dateTo) return false;
+      if (!dfs) return false;
+    }
     // Radius filter
     if (radiusCenter && radiusVal > 0) {
       const dist = haversine(radiusCenter.lat, radiusCenter.lng, p.gps_lat, p.gps_long);
@@ -747,7 +782,7 @@ function applyFilters() {
   }
 
   // Filter pricing matrix too
-  const filteredPM = filterPricingMatrix(minA, maxA, cid, radiusVal);
+  const filteredPM = filterPricingMatrix(minA, maxA, county, radiusVal, dateFrom, dateTo);
   renderPricingMarkers(filteredPM);
 
   // Update pin count
@@ -777,7 +812,9 @@ function clearRadius() {
 function resetFilters() {
   document.getElementById('minAcres').value = '';
   document.getElementById('maxAcres').value = '';
-  document.getElementById('countyId').value = '';
+  document.getElementById('countyFilter').value = '';
+  document.getElementById('dateFrom').value = '';
+  document.getElementById('dateTo').value = '';
   document.getElementById('status').value = '';
   radiusCenter = null;
   if (radiusCircle) { map.removeLayer(radiusCircle); radiusCircle = null; }
@@ -849,16 +886,17 @@ async function generateAndCache() {
   console.log('Fetching properties from Supabase...');
   const properties = await fetchProperties();
   propertyCount = properties.length;
-  console.log(`Fetched ${propertyCount} properties (${properties.filter(p => p.airtable_prices && p.airtable_prices.length).length} enriched)`);
+  const enriched = properties.filter(p => p.airtable_prices && p.airtable_prices.length).length;
+  console.log('Fetched ' + propertyCount + ' properties (' + enriched + ' enriched)');
 
   console.log('Fetching pricing matrix...');
   const pricingMatrix = await fetchPricingMatrix();
   pmCount = pricingMatrix.length;
-  console.log(`Fetched ${pmCount} unmatched pricing matrix entries`);
+  console.log('Fetched ' + pmCount + ' unmatched pricing matrix entries');
 
   generatedAt = new Date().toISOString();
   cachedHTML = buildHTML(properties, pricingMatrix);
-  console.log(`Generated HTML at ${generatedAt}`);
+  console.log('Generated HTML at ' + generatedAt);
 }
 
 const PORT = process.env.PORT || 3000;
@@ -912,9 +950,9 @@ async function startServer() {
     }
   });
 
-  server.listen(PORT, () => {
-    console.log(`Map server running on port ${PORT}`);
-    console.log(`Properties: ${propertyCount} | Pricing Matrix: ${pmCount}`);
+  server.listen(PORT, function() {
+    console.log('Map server running on port ' + PORT);
+    console.log('Properties: ' + propertyCount + ' | Pricing Matrix: ' + pmCount);
   });
 }
 
