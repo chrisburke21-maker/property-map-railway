@@ -36,12 +36,48 @@ WHERE p.gps_lat IS NOT NULL AND p.gps_long IS NOT NULL
 GROUP BY p.id
 ORDER BY p.county, p.apn`;
 
+const PRICING_MATRIX_SQL = `
+SELECT pm.id, pm.apn_raw, pm.apn_normalized, pm.county, pm.state,
+       pm.county_identifier, pm.subdivision,
+       pm.acreage, pm.gps_lat, pm.gps_long,
+       pm.cash_price, pm.terms_down_payment, pm.terms_monthly_payment,
+       pm.terms_length_months, pm.source_platform, pm.listing_url,
+       pm.date_observed
+FROM pricing_matrix pm
+WHERE pm.gps_lat IS NOT NULL AND pm.gps_long IS NOT NULL
+  AND pm.property_id IS NULL
+ORDER BY pm.county, pm.apn_normalized`;
+
+const PRICING_ENRICHMENT_SQL = `
+SELECT pm.property_id,
+       json_agg(json_build_object(
+         'platform', pm.source_platform,
+         'url', pm.listing_url,
+         'cash_price', pm.cash_price,
+         'down', pm.terms_down_payment,
+         'monthly', pm.terms_monthly_payment,
+         'months', pm.terms_length_months,
+         'date', pm.date_observed
+       ) ORDER BY pm.date_observed DESC) AS airtable_prices
+FROM pricing_matrix pm
+WHERE pm.property_id IS NOT NULL
+GROUP BY pm.property_id`;
+
 async function fetchProperties() {
   const client = new Client(dbConfig);
   await client.connect();
-  const result = await client.query(SQL);
+  const [propResult, enrichResult] = await Promise.all([
+    client.query(SQL),
+    client.query(PRICING_ENRICHMENT_SQL)
+  ]);
   await client.end();
-  return result.rows.map(r => ({
+
+  const enrichMap = {};
+  for (const row of enrichResult.rows) {
+    enrichMap[row.property_id] = row.airtable_prices;
+  }
+
+  return propResult.rows.map(r => ({
     id: r.id,
     apn: r.apn,
     county: r.county,
@@ -54,11 +90,37 @@ async function fetchProperties() {
     gps_lat: parseFloat(r.gps_lat),
     gps_long: parseFloat(r.gps_long),
     dom: r.days_on_market,
-    listings: r.listings || []
+    listings: r.listings || [],
+    airtable_prices: enrichMap[r.id] || []
   }));
 }
 
-function buildHTML(properties) {
+async function fetchPricingMatrix() {
+  const client = new Client(dbConfig);
+  await client.connect();
+  const result = await client.query(PRICING_MATRIX_SQL);
+  await client.end();
+  return result.rows.map(r => ({
+    id: r.id,
+    apn: r.apn_normalized || r.apn_raw,
+    county: r.county,
+    state: r.state,
+    county_identifier: r.county_identifier,
+    subdivision: r.subdivision,
+    acreage: r.acreage ? parseFloat(r.acreage) : null,
+    gps_lat: parseFloat(r.gps_lat),
+    gps_long: parseFloat(r.gps_long),
+    cash_price: r.cash_price ? parseFloat(r.cash_price) : null,
+    down: r.terms_down_payment ? parseFloat(r.terms_down_payment) : null,
+    monthly: r.terms_monthly_payment ? parseFloat(r.terms_monthly_payment) : null,
+    months: r.terms_length_months,
+    platform: r.source_platform,
+    url: r.listing_url,
+    date: r.date_observed
+  }));
+}
+
+function buildHTML(properties, pricingMatrix) {
   const generated = new Date().toISOString();
   return `<!DOCTYPE html>
 <html lang="en">
@@ -148,6 +210,10 @@ function buildHTML(properties) {
     <label>Radius (mi)</label>
     <input type="number" id="radius" placeholder="Off" step="any" style="width:90px">
   </div>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:#d946ef;margin-left:4px">
+    <input type="checkbox" id="showPM" checked onchange="togglePricingLayer(this.checked)" style="accent-color:#d946ef;width:16px;height:16px;cursor:pointer">
+    Airtable
+  </label>
   <button onclick="applyFilters()">Apply</button>
   <button onclick="resetFilters()" style="background:#475569">Reset</button>
   <button onclick="clearRadius()" id="clearRadiusBtn" style="background:#dc2626;display:none">Clear Radius</button>
@@ -170,6 +236,11 @@ function buildHTML(properties) {
   <div class="stat-box"><div class="stat-value" id="statDown">—</div><div class="stat-label">Avg Down</div></div>
   <div class="stat-box"><div class="stat-value" id="statMonthly">—</div><div class="stat-label">Avg Monthly</div></div>
   <div class="stat-box"><div class="stat-value" id="statTermOverall">—</div><div class="stat-label">Avg Term</div></div>
+  <div style="border-left:1px solid #334155;height:36px;margin:0 4px"></div>
+  <div class="stat-box"><div class="stat-value" id="statPmCashAc" style="color:#e879f9">—</div><div class="stat-label">AT Cash/Ac</div></div>
+  <div class="stat-box"><div class="stat-value" id="statPmDownAc" style="color:#e879f9">—</div><div class="stat-label">AT Down/Ac</div></div>
+  <div class="stat-box"><div class="stat-value" id="statPmMonthlyAc" style="color:#e879f9">—</div><div class="stat-label">AT Monthly/Ac</div></div>
+  <div class="stat-box"><div class="stat-value" id="statPmCount" style="color:#e879f9">—</div><div class="stat-label">AT Entries</div></div>
 </div>
 
 <div id="map"></div>
@@ -177,6 +248,7 @@ function buildHTML(properties) {
 <script>
 // Data generated ${generated}
 window.PROPERTIES = ${JSON.stringify(properties)};
+window.PRICING_MATRIX = ${JSON.stringify(pricingMatrix)};
 
 const COLORS = {
   'under_1':  '#3B82F6',
@@ -209,12 +281,26 @@ const LABELS = {
   div.innerHTML = '<h4>Acreage Range</h4>' +
     Object.entries(COLORS).map(([range, color]) =>
       '<div class="legend-item"><span class="legend-dot" style="background:' + color + '"></span>' + (LABELS[range] || range) + '</div>'
-    ).join('');
+    ).join('') +
+    '<div style="margin-top:8px;border-top:1px solid #e2e8f0;padding-top:6px">' +
+    '<h4>Data Source</h4>' +
+    '<div class="legend-item"><span style="width:12px;height:12px;background:#d946ef;border:2px solid #86198f;border-radius:50%;display:inline-block"></span> Airtable (Unmatched)</div>' +
+    '</div>';
   return div;
 };
 legend.addTo(map);
 
+// Pricing markers use a high-zIndex pane with DOM-based markers for reliable clicks
+map.createPane('pricingPane');
+map.getPane('pricingPane').style.zIndex = 650;
+
 let markers = L.layerGroup().addTo(map);
+let pricingMarkers = L.layerGroup().addTo(map);
+
+function togglePricingLayer(show) {
+  if (show) { map.addLayer(pricingMarkers); }
+  else { map.removeLayer(pricingMarkers); }
+}
 
 // Radius filter state
 let radiusCenter = null;  // { lat, lng, apn }
@@ -262,7 +348,59 @@ function computeRadiusStats(filtered) {
   };
 }
 
-function showRadiusStats(filtered) {
+function renderPricingMarkers(data) {
+  pricingMarkers.clearLayers();
+  data.forEach(function(pm) {
+    var tip = '<b>' + (pm.apn || 'No APN') + '</b>';
+    if (pm.acreage) tip += ' — ' + pm.acreage + ' ac';
+    if (pm.cash_price) tip += ' — ' + formatPrice(pm.cash_price);
+    tip += '<br><span style="color:#e879f9">Airtable / ' + (pm.platform || 'Unknown') + '</span>';
+
+    var popup = '<h3 style="color:#a21caf">' + (pm.apn || 'No APN') + '</h3>';
+    popup += '<div class="sub">' + pm.county + ', ' + pm.state + ' &bull; <span style="color:#e879f9">Pricing Matrix</span></div>';
+    popup += '<table style="width:100%;font-size:13px;border-collapse:collapse">';
+    if (pm.acreage) popup += '<tr><td style="color:#64748b">Acreage</td><td style="text-align:right"><b>' + pm.acreage + '</b> ac</td></tr>';
+    if (pm.cash_price) popup += '<tr><td style="color:#64748b">Cash Price</td><td style="text-align:right"><span style="font-weight:700;color:#a21caf">' + formatPrice(pm.cash_price) + '</span></td></tr>';
+    if (pm.cash_price && pm.acreage) popup += '<tr><td style="color:#64748b">Cash $/Acre</td><td style="text-align:right">' + formatPrice(pm.cash_price / pm.acreage) + '</td></tr>';
+    if (pm.down) popup += '<tr><td style="color:#64748b">Down Payment</td><td style="text-align:right">' + formatPrice(pm.down) + '</td></tr>';
+    if (pm.monthly) popup += '<tr><td style="color:#64748b">Monthly</td><td style="text-align:right">' + formatPrice(pm.monthly) + '/mo</td></tr>';
+    if (pm.months) popup += '<tr><td style="color:#64748b">Term</td><td style="text-align:right">' + pm.months + ' months</td></tr>';
+    if (pm.platform) popup += '<tr><td style="color:#64748b">Platform</td><td style="text-align:right">' + pm.platform + '</td></tr>';
+    if (pm.date) popup += '<tr><td style="color:#64748b">Date Observed</td><td style="text-align:right">' + pm.date + '</td></tr>';
+    popup += '</table>';
+    if (pm.url) popup += '<div style="margin-top:6px"><a href="' + pm.url + '" target="_blank">View Listing</a></div>';
+
+    var icon = L.divIcon({
+      className: '',
+      html: '<div style="width:14px;height:14px;background:#d946ef;border:2px solid #86198f;border-radius:50%;cursor:pointer"></div>',
+      iconSize: [14, 14],
+      iconAnchor: [7, 7]
+    });
+    var marker = L.marker([pm.gps_lat, pm.gps_long], { icon: icon, pane: 'pricingPane' })
+      .bindTooltip(tip, { direction: 'top', offset: [0, -10] })
+      .bindPopup(popup, { maxWidth: 400 });
+    pricingMarkers.addLayer(marker);
+  });
+}
+
+function computePMStats(filtered) {
+  var cashPerAcre = [], downPerAcre = [], monthlyPerAcre = [];
+  filtered.forEach(function(pm) {
+    if (pm.cash_price && pm.cash_price > 0 && pm.acreage && pm.acreage > 0) {
+      cashPerAcre.push(pm.cash_price / pm.acreage);
+    }
+    if (pm.down && pm.down > 0 && pm.acreage && pm.acreage > 0) {
+      downPerAcre.push(pm.down / pm.acreage);
+    }
+    if (pm.monthly && pm.monthly > 0 && pm.acreage && pm.acreage > 0) {
+      monthlyPerAcre.push(pm.monthly / pm.acreage);
+    }
+  });
+  var avg = function(arr) { return arr.length ? arr.reduce(function(a,b){return a+b;}, 0) / arr.length : null; };
+  return { cashPerAcre: avg(cashPerAcre), downPerAcre: avg(downPerAcre), monthlyPerAcre: avg(monthlyPerAcre), count: filtered.length };
+}
+
+function showRadiusStats(filtered, filteredPM) {
   const stats = computeRadiusStats(filtered);
   const fmt = v => v != null ? formatPrice(v) : null;
   document.getElementById('statCashAc').textContent = fmt(stats.cashPerAcre) || 'N/A';
@@ -282,6 +420,12 @@ function showRadiusStats(filtered) {
   document.getElementById('statMonthly').className = stats.monthlyTotal != null ? 'stat-value' : 'stat-na';
   document.getElementById('statTermOverall').textContent = stats.termMonths != null ? Math.round(stats.termMonths) + ' mo' : 'N/A';
   document.getElementById('statTermOverall').className = stats.termMonths != null ? 'stat-value' : 'stat-na';
+  // Airtable pricing matrix stats
+  const pmStats = computePMStats(filteredPM || []);
+  document.getElementById('statPmCashAc').textContent = fmt(pmStats.cashPerAcre) || 'N/A';
+  document.getElementById('statPmDownAc').textContent = fmt(pmStats.downPerAcre) || 'N/A';
+  document.getElementById('statPmMonthlyAc').textContent = fmt(pmStats.monthlyPerAcre) || 'N/A';
+  document.getElementById('statPmCount').textContent = pmStats.count || '0';
   document.getElementById('radiusStats').classList.add('active');
 }
 
@@ -423,6 +567,12 @@ function renderMarkers(data) {
     // Hover tooltip — APN, size, cash price, terms
     let tip = '<b>' + p.apn + '</b> — ' + p.acreage + ' ac';
     if (lowestCash) tip += ' — ' + formatPrice(lowestCash.price);
+    // Airtable pricing in tooltip
+    const atp = p.airtable_prices || [];
+    if (atp.length) {
+      const bestAT = atp.find(a => a.cash_price && a.cash_price > 0);
+      if (bestAT) tip += '<br><span style="color:#e879f9">AT: ' + formatPrice(bestAT.cash_price) + '</span>';
+    }
     if (withTerms) {
       tip += '<br><span style="color:#6366f1">';
       if (withTerms.terms_down) tip += formatPrice(withTerms.terms_down) + ' down';
@@ -464,6 +614,28 @@ function renderMarkers(data) {
       popup += '<div class="section detail">No active listings</div>';
     }
 
+    // Airtable pricing enrichment
+    if (atp.length) {
+      popup += '<div class="section"><b style="color:#a21caf">Airtable Pricing (' + atp.length + ')</b></div>';
+      atp.forEach(function(a) {
+        popup += '<div class="listing-row">';
+        if (a.url) popup += '<a href="' + a.url + '" target="_blank" style="color:#a21caf">' + (a.platform || 'Link') + '</a>';
+        else if (a.platform) popup += '<span style="color:#a21caf">' + a.platform + '</span>';
+        if (a.seller) popup += ' <span style="color:#94a3b8">(' + a.seller + ')</span>';
+        if (a.date) popup += ' <span style="color:#94a3b8">' + a.date.substring(0, 10) + '</span>';
+        popup += '<br>';
+        if (a.cash_price) popup += '<span style="font-weight:700;color:#a21caf">' + formatPrice(a.cash_price) + '</span> cash';
+        if (a.down || a.monthly) {
+          popup += '<br><span style="color:#c084fc;font-size:12px">';
+          if (a.down) popup += formatPrice(a.down) + ' down';
+          if (a.monthly) popup += ' / ' + formatPrice(a.monthly) + '/mo';
+          if (a.months) popup += ' x ' + a.months + ' mo';
+          popup += '</span>';
+        }
+        popup += '</div>';
+      });
+    }
+
     // Highlight the center pin if radius is active
     const isCenter = radiusCenter && p.gps_lat === radiusCenter.lat && p.gps_long === radiusCenter.lng;
     const marker = L.circleMarker([p.gps_lat, p.gps_long], {
@@ -494,8 +666,28 @@ function renderMarkers(data) {
 
     markers.addLayer(marker);
   });
+}
 
-  document.getElementById('pinCount').textContent = data.length + ' properties';
+function filterPricingMatrix(minA, maxA, cid, radiusVal) {
+  return (window.PRICING_MATRIX || []).filter(function(pm) {
+    if (pm.acreage && pm.acreage < minA) return false;
+    if (pm.acreage && maxA < Infinity && pm.acreage > maxA) return false;
+    if (cid) {
+      var matchCounty = (pm.county || '').toLowerCase().includes(cid);
+      var matchCid = (pm.county_identifier || '').toLowerCase().includes(cid);
+      if (!matchCounty && !matchCid) return false;
+    }
+    // Radius filter
+    if (radiusCenter && radiusVal > 0) {
+      var dist = haversine(radiusCenter.lat, radiusCenter.lng, pm.gps_lat, pm.gps_long);
+      if (dist > radiusVal) return false;
+    }
+    // Polygon filter
+    if (polyShape && polyPoints.length >= 3) {
+      if (!pointInPolygon(pm.gps_lat, pm.gps_long, polyPoints)) return false;
+    }
+    return true;
+  });
 }
 
 function applyFilters() {
@@ -511,7 +703,11 @@ function applyFilters() {
   const filtered = window.PROPERTIES.filter(p => {
     if (p.acreage < minA) return false;
     if (p.acreage > maxA) return false;
-    if (cid && !(p.county_identifier || '').toLowerCase().includes(cid)) return false;
+    if (cid) {
+      var mc = (p.county || '').toLowerCase().includes(cid);
+      var mi = (p.county_identifier || '').toLowerCase().includes(cid);
+      if (!mc && !mi) return false;
+    }
     if (status && p.status !== status) return false;
     // Radius filter
     if (radiusCenter && radiusVal > 0) {
@@ -550,9 +746,18 @@ function applyFilters() {
     }
   }
 
+  // Filter pricing matrix too
+  const filteredPM = filterPricingMatrix(minA, maxA, cid, radiusVal);
+  renderPricingMarkers(filteredPM);
+
+  // Update pin count
+  var countText = filtered.length + ' properties';
+  if (filteredPM.length) countText += ' + ' + filteredPM.length + ' airtable';
+  document.getElementById('pinCount').textContent = countText;
+
   // Show/hide stats for any area filter
   if (hasAreaFilter) {
-    showRadiusStats(filtered);
+    showRadiusStats(filtered, filteredPM);
   } else {
     hideRadiusStats();
   }
@@ -594,6 +799,10 @@ function resetFilters() {
   }
   hideRadiusStats();
   renderMarkers(window.PROPERTIES);
+  renderPricingMarkers(window.PRICING_MATRIX || []);
+  var countText = window.PROPERTIES.length + ' properties';
+  if (window.PRICING_MATRIX && window.PRICING_MATRIX.length) countText += ' + ' + window.PRICING_MATRIX.length + ' airtable';
+  document.getElementById('pinCount').textContent = countText;
 }
 
 async function refreshData() {
@@ -601,12 +810,16 @@ async function refreshData() {
   btn.textContent = 'Refreshing...';
   btn.disabled = true;
   try {
-    const res = await fetch('/api/properties');
-    if (!res.ok) throw new Error('Server returned ' + res.status);
-    const data = await res.json();
-    window.PROPERTIES = data;
+    const [propRes, pmRes] = await Promise.all([
+      fetch('/api/properties'),
+      fetch('/api/pricing-matrix')
+    ]);
+    if (!propRes.ok) throw new Error('Properties: ' + propRes.status);
+    window.PROPERTIES = await propRes.json();
+    if (pmRes.ok) window.PRICING_MATRIX = await pmRes.json();
     applyFilters();
-    btn.textContent = data.length + ' properties loaded';
+    var cnt = window.PROPERTIES.length + ' + ' + (window.PRICING_MATRIX || []).length + ' loaded';
+    btn.textContent = cnt;
     setTimeout(() => { btn.textContent = 'Refresh Data'; }, 3000);
   } catch(e) {
     btn.textContent = 'Refresh Failed';
@@ -617,6 +830,10 @@ async function refreshData() {
 
 // Initial render
 renderMarkers(window.PROPERTIES);
+renderPricingMarkers(window.PRICING_MATRIX || []);
+var initCount = window.PROPERTIES.length + ' properties';
+if (window.PRICING_MATRIX && window.PRICING_MATRIX.length) initCount += ' + ' + window.PRICING_MATRIX.length + ' airtable';
+document.getElementById('pinCount').textContent = initCount;
 <\/script>
 </body>
 </html>`;
@@ -625,15 +842,23 @@ renderMarkers(window.PROPERTIES);
 // --- Server state ---
 let cachedHTML = null;
 let propertyCount = 0;
+let pmCount = 0;
 let generatedAt = null;
 
 async function generateAndCache() {
   console.log('Fetching properties from Supabase...');
   const properties = await fetchProperties();
   propertyCount = properties.length;
+  console.log(`Fetched ${propertyCount} properties (${properties.filter(p => p.airtable_prices && p.airtable_prices.length).length} enriched)`);
+
+  console.log('Fetching pricing matrix...');
+  const pricingMatrix = await fetchPricingMatrix();
+  pmCount = pricingMatrix.length;
+  console.log(`Fetched ${pmCount} unmatched pricing matrix entries`);
+
   generatedAt = new Date().toISOString();
-  cachedHTML = buildHTML(properties);
-  console.log(`Generated HTML with ${propertyCount} properties at ${generatedAt}`);
+  cachedHTML = buildHTML(properties, pricingMatrix);
+  console.log(`Generated HTML at ${generatedAt}`);
 }
 
 const PORT = process.env.PORT || 3000;
@@ -651,6 +876,7 @@ async function startServer() {
       res.end(JSON.stringify({
         status: 'ok',
         properties: propertyCount,
+        pricing_matrix: pmCount,
         generated: generatedAt
       }));
 
@@ -667,6 +893,19 @@ async function startServer() {
         res.end(JSON.stringify({ error: e.message }));
       }
 
+    } else if (req.url === '/api/pricing-matrix') {
+      try {
+        const pm = await fetchPricingMatrix();
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.end(JSON.stringify(pm));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+
     } else {
       res.writeHead(404);
       res.end('Not found');
@@ -675,7 +914,7 @@ async function startServer() {
 
   server.listen(PORT, () => {
     console.log(`Map server running on port ${PORT}`);
-    console.log(`Properties loaded: ${propertyCount}`);
+    console.log(`Properties: ${propertyCount} | Pricing Matrix: ${pmCount}`);
   });
 }
 
